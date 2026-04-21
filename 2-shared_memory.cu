@@ -5,15 +5,52 @@
 #include <algorithm>
 #include "include/cuda_utils.hpp"
 
-__global__ void cuda_matrix_multiply(const int* matrix_a, const int* matrix_b, int* matrix_c, const int M, const int K, const int N){
+__global__ void cuda_matrix_multiply_shared(const int* matrix_a, const int* matrix_b, int* matrix_c, const int M, const int K, const int N) {
+      int row = threadIdx.y + blockIdx.y * blockDim.y;
+      int col = threadIdx.x + blockIdx.x * blockDim.x;
+
+      // Un único array dinámico, partido en dos mitades
+      extern __shared__ int shared_mem[];
+      int* tileA = shared_mem;                              // [TILE x TILE]
+      int* tileB = shared_mem + blockDim.y * blockDim.x;   // [TILE x TILE]
+
+      int sum = 0;
+      int numTiles = (K + blockDim.x - 1) / blockDim.x;
+
+      for (int t = 0; t < numTiles; t++) {
+          // Carga cooperativa — cada hilo carga un elemento
+          int aCol = t * blockDim.x + threadIdx.x;
+          int bRow = t * blockDim.y + threadIdx.y;
+
+          tileA[threadIdx.y * blockDim.x + threadIdx.x] = (row < M && aCol < K)
+              ? matrix_a[row * K + aCol] : 0;
+
+          tileB[threadIdx.y * blockDim.x + threadIdx.x] = (bRow < K && col < N)
+              ? matrix_b[bRow * N + col] : 0;
+
+          __syncthreads();  // esperar a que el tile esté listo
+
+          for (int i = 0; i < blockDim.x; i++)
+              sum += tileA[threadIdx.y * blockDim.x + i] * tileB[i * blockDim.x + threadIdx.x];
+
+          __syncthreads();  // antes de sobreescribir el tile en la siguiente iteración
+      }
+
+      if (row < M && col < N)
+          matrix_c[row * N + col] = sum;
+  }
+
+__global__ void cuda_matrix_multiply_global(const int* matrix_a, const int* matrix_b, int* matrix_c, const int M, const int K, const int N){
     int row = threadIdx.y + blockIdx.y * blockDim.y;
     int col = threadIdx.x + blockIdx.x * blockDim.x;
 
     if(row >= M || col >= N) return;
+
     int sum = 0;
     for(int i=0; i<K; i++){
         sum += matrix_a[row * K + i] * matrix_b[i * N + col];
     }
+
     matrix_c[row * N + col] = sum; 
 }
 
@@ -51,7 +88,8 @@ void print_matrix_10x10(int* matrix, int rows, int cols, const char* name){
 void matrix_multiply(const int M, const int K, const int N, const bool serial){
     int* A = nullptr;
     int* B = nullptr;
-    int* C = nullptr;
+    int* C_global = nullptr;
+    int* C_shared = nullptr;
 
     int* devA = nullptr;
     int* devB = nullptr;
@@ -59,7 +97,8 @@ void matrix_multiply(const int M, const int K, const int N, const bool serial){
 
     cudaMallocHost(&A, M*K*sizeof(int));
     cudaMallocHost(&B, K*N*sizeof(int));
-    cudaMallocHost(&C, M*N*sizeof(int));
+    cudaMallocHost(&C_global, M*N*sizeof(int));
+    cudaMallocHost(&C_shared, M*N*sizeof(int));
 
     init_array(A, M*K);
     init_array(B, K*N);
@@ -72,44 +111,32 @@ void matrix_multiply(const int M, const int K, const int N, const bool serial){
     cudaMemcpy(devB, B, K*N*sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(devC, 0, M*N*sizeof(int));
 
-    dim3 blockSize(32,32);
+    dim3 blockSize(32, 32);
     dim3 gridSize((N + blockSize.x -1) / blockSize.x,
                   (M + blockSize.y -1) / blockSize.y);  
 
-    float ms = measure_cuda_time([&]() {
-        cuda_matrix_multiply<<<gridSize, blockSize>>>(devA, devB, devC, M, K, N);
+    float ms_global = measure_cuda_time([&]() {
+        cuda_matrix_multiply_global<<<gridSize, blockSize>>>(devA, devB, devC, M, K, N);
     });
 
-    cudaMemcpy(C, devC, M*N*sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(C_global, devC, M*N*sizeof(int), cudaMemcpyDeviceToHost);
 
-    print_matrix_10x10(A, M, K, "A");
-    print_matrix_10x10(B, K, N, "B");
-    print_matrix_10x10(C, M, N, "C");    
+    cudaMemset(devC, 0, M*N*sizeof(int));
 
-    if(serial){
-        int* C_serial = nullptr;
-        cudaMallocHost(&C_serial, M*N*sizeof(int));
-        memset(C_serial, 0, M*N*sizeof(int));
+    size_t sharedMemSize = 2 * blockSize.x * blockSize.y * sizeof(int);
 
-        auto start = std::chrono::high_resolution_clock::now();
+    float ms_shared = measure_cuda_time([&]() {
+        cuda_matrix_multiply_shared<<<gridSize, blockSize, sharedMemSize>>>(devA, devB, devC, M, K, N);
+    });
 
-        serial_matrix_multiply(A, B, C_serial, M, K, N);
+    cudaMemcpy(C_shared, devC, M*N*sizeof(int), cudaMemcpyDeviceToHost);
 
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> duration = end - start;
+    if(std::equal(C_global, C_global + M*N, C_shared)) printf("Matrices are equal\n");  
 
-        print_matrix_10x10(C_serial, M, N, "C serial");
-        if(std::equal(C, C + M*N, C_serial)) printf("Matrices are equal\n");         
-        printf("CPU Time: %.4f ms\n", duration.count());
+    printf("Kernel Global Memory Time: %.4f ms\n", ms_global);
+    printf("Kernel Shared Memory Time: %.4f ms\n", ms_shared);
 
-        cudaFreeHost(C_serial);
-    }
-
-    
-
-    printf("Kernel Time: %.4f ms\n", ms);
-
-    cudaFreeHost(A); cudaFreeHost(B); cudaFreeHost(C);
+    cudaFreeHost(A); cudaFreeHost(B); cudaFreeHost(C_global); cudaFreeHost(C_shared);
     cudaFree(devA); cudaFree(devB); cudaFree(devC);
 }
 
